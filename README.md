@@ -9,10 +9,13 @@ Two Claude Code skills that make [Ruflo](https://github.com/ruvnet/ruflo) (also 
 Ruflo is an agent orchestration framework that runs on top of Claude Code. To set itself up, it writes directly into several Claude Code configuration files:
 
 - `.claude/settings.json` — hooks, permissions, tool allowances
+- `.claude/settings.local.json` — local permission overrides
 - `CLAUDE.md` — project instructions
 - `.claude/agents/*.md` — agent definitions
 - `.claude/commands/*` — slash commands
 - `.claude/helpers/` — runtime helper scripts called by hooks
+- `.mcp.json` — MCP server registrations
+- `claude-flow.config.json` — Ruflo configuration
 
 **Ruflo's init is destructive by default.** Running `npx ruflo@latest init --wizard` in a project that already has Claude Code configuration will silently overwrite whatever was there. There is no dry-run, no merge, no confirmation step.
 
@@ -72,6 +75,8 @@ On the next upgrade, the snapshot is the reference that lets the skill distingui
 
 Without the snapshot, ruflo-upgrade falls back to conservative mode and asks about every changed file.
 
+**What the snapshot stores matters.** For `settings.json` (shared) the snapshot is a copy of Ruflo's raw staging output — not the merged file that was written to the project. For `CLAUDE.md` (section-managed) the snapshot stores only the Ruflo sentinel block, not the full file. This distinction is critical: when the next upgrade diffs BASE vs OURS, it is comparing Ruflo's pure output against the current state, not the user's merged result against itself.
+
 ### Ownership modes
 
 Every managed file has an ownership mode that determines its merge strategy:
@@ -104,6 +109,8 @@ Ruflo's content in `CLAUDE.md` is wrapped in hard markers:
 
 Content outside the markers is user-owned and is never modified. On upgrade, only the content between the markers is replaced. If markers are absent (project predates this skill), the entire file is treated as user content and the Ruflo block is appended.
 
+**Conflict classification for `CLAUDE.md` is scoped to the sentinel block.** When ruflo-upgrade runs the 3-way diff, it extracts the block between the markers from both OURS and the snapshot, and diffs only those. User edits outside the markers are invisible to conflict detection — they can never trigger a conflict, and they are never touched during apply.
+
 ### Helper files
 
 Ruflo installs helper scripts (`.claude/helpers/*.cjs`, `.sh`, etc.) that hook commands in `settings.json` call at runtime. If an upgrade updates hook command paths but not the helper files they reference, the project silently breaks.
@@ -127,7 +134,7 @@ If validation fails, all `.ruflo-tmp` files are deleted and the live project is 
 After every merge, the skills run a set of non-blocking checks and surface the results as warnings in the proposal:
 
 - JSON syntax valid
-- Hook event names recognised (`PreToolUse`, `PostToolUse`, `Stop`, `SubagentStop`, `Notification`)
+- Hook event names recognised by the skill's validator: `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `SubagentStop`, `SubagentStart`, `Notification`, `UserPromptSubmit`, `SessionStart`, `SessionEnd`, `PreCompact`, `PermissionRequest` — anything not on this list is flagged as "unrecognised by this skill's validator" (not necessarily invalid; Claude Code may support events the skill doesn't yet know about)
 - All file paths referenced in hook commands exist on disk
 - No duplicate hooks after normalisation
 - Permission patterns use `:*` suffix for prefix matching
