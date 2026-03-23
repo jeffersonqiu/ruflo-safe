@@ -34,6 +34,8 @@ Run and capture all output:
 ```bash
 echo "=== settings.json ===" && \
   (cat .claude/settings.json 2>/dev/null || echo "(not found)")
+echo "=== settings.local.json ===" && \
+  (cat .claude/settings.local.json 2>/dev/null || echo "(not found)")
 echo "=== CLAUDE.md ===" && \
   (cat CLAUDE.md 2>/dev/null || echo "(not found)")
 echo "=== agents ===" && \
@@ -42,6 +44,10 @@ echo "=== commands ===" && \
   (ls .claude/commands/ 2>/dev/null || echo "(not found)")
 echo "=== helpers ===" && \
   (ls .claude/helpers/ 2>/dev/null || echo "(not found)")
+echo "=== .mcp.json ===" && \
+  (cat .mcp.json 2>/dev/null || echo "(not found)")
+echo "=== claude-flow.config.json ===" && \
+  (cat claude-flow.config.json 2>/dev/null || echo "(not found)")
 echo "=== existing snapshot ===" && \
   (cat .claude/ruflo-snapshot/manifest.json 2>/dev/null || echo "(not found)")
 ```
@@ -65,11 +71,14 @@ If any config existed in Step 2, create a timestamped backup:
 BACKUP_DIR=".claude/backup-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR/agents" "$BACKUP_DIR/commands" "$BACKUP_DIR/helpers"
 
-[ -f .claude/settings.json ] && cp .claude/settings.json "$BACKUP_DIR/settings.json"
-[ -f CLAUDE.md ]             && cp CLAUDE.md "$BACKUP_DIR/CLAUDE.md"
-[ -d .claude/agents ]        && cp .claude/agents/*.md "$BACKUP_DIR/agents/" 2>/dev/null
-[ -d .claude/commands ]      && cp -r .claude/commands/. "$BACKUP_DIR/commands/" 2>/dev/null
-[ -d .claude/helpers ]       && cp -r .claude/helpers/. "$BACKUP_DIR/helpers/" 2>/dev/null
+[ -f .claude/settings.json ]       && cp .claude/settings.json "$BACKUP_DIR/settings.json"
+[ -f .claude/settings.local.json ] && cp .claude/settings.local.json "$BACKUP_DIR/settings.local.json"
+[ -f CLAUDE.md ]                   && cp CLAUDE.md "$BACKUP_DIR/CLAUDE.md"
+[ -d .claude/agents ]              && cp .claude/agents/*.md "$BACKUP_DIR/agents/" 2>/dev/null
+[ -d .claude/commands ]            && cp -r .claude/commands/. "$BACKUP_DIR/commands/" 2>/dev/null
+[ -d .claude/helpers ]             && cp -r .claude/helpers/. "$BACKUP_DIR/helpers/" 2>/dev/null
+[ -f .mcp.json ]                   && cp .mcp.json "$BACKUP_DIR/.mcp.json"
+[ -f claude-flow.config.json ]     && cp claude-flow.config.json "$BACKUP_DIR/claude-flow.config.json"
 
 echo "Backed up to $BACKUP_DIR"
 ls -la "$BACKUP_DIR"
@@ -173,13 +182,13 @@ Merge decisions for settings.json:
   + Added 5 Ruflo hooks (PostToolUse×3, PreToolUse×2)
   ✓ Kept your 2 existing hooks
   ✓ Kept your permissions (unioned with Ruflo's)
-  ⚠ Hook event "SubagentEnd" not recognised — kept but flagging
+  ⚠ Hook event "SubagentEnd" unrecognised by this skill's validator — kept but flagging
   ⚠ Helper .claude/helpers/router.sh referenced but not found in staging
 ```
 
 **Soft validation** — run after computing the merge, surface as warnings (never block):
 - JSON syntactically valid: `node -e "JSON.parse(require('fs').readFileSync('.claude/settings.json.ruflo-tmp','utf8'))"`
-- Hook event names recognised (valid: `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStop`, `Notification`) — warn on any others
+- Hook event names recognised by this skill's validator (valid: `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `SubagentStop`, `SubagentStart`, `Notification`, `UserPromptSubmit`, `SessionStart`, `SessionEnd`, `PreCompact`, `PermissionRequest`) — warn on any others as "unrecognised by this skill's validator" (not necessarily invalid)
 - All file paths in hook commands exist on disk
 - No duplicate hooks after normalisation
 - Permission patterns use `:*` suffix for prefix matching (warn on bare `*`)
@@ -225,7 +234,7 @@ Merged (requires your review):
   📝 CLAUDE.md                     — your content preserved, Ruflo block appended
 
 Validation warnings (non-blocking):
-  ⚠ Hook event "SubagentEnd" unrecognised
+  ⚠ Hook event "SubagentEnd" unrecognised by this skill's validator
   ⚠ .claude/helpers/router.sh referenced but not generated
 
 Your originals are safe at: .claude/backup-YYYYMMDD-HHMMSS/
@@ -301,8 +310,16 @@ RUFLO_VERSION=$(npx ruflo@latest --version 2>/dev/null | tr -d '\n')
 SNAPSHOT_DIR=".claude/ruflo-snapshot"
 mkdir -p "$SNAPSHOT_DIR/agents" "$SNAPSHOT_DIR/commands" "$SNAPSHOT_DIR/helpers"
 
-cp .claude/settings.json "$SNAPSHOT_DIR/settings.json"
-cp CLAUDE.md "$SNAPSHOT_DIR/CLAUDE.md"
+# shared: copy pure Ruflo output from staging, NOT the merged live file.
+# This preserves Ruflo's unmodified output as the merge base for future upgrades.
+cp "$STAGING_DIR/.claude/settings.json" "$SNAPSHOT_DIR/settings.json"
+
+# section-managed: extract only the Ruflo sentinel block from staging.
+# The snapshot must not include user content outside the markers.
+sed -n '/<!-- ruflo:start/,/<!-- ruflo:end -->/p' \
+  "$STAGING_DIR/CLAUDE.md" > "$SNAPSHOT_DIR/CLAUDE.md"
+
+# whole-file: copy from the live applied file (correct — these are entirely Ruflo-owned).
 [ -d .claude/agents ]   && cp .claude/agents/*.md "$SNAPSHOT_DIR/agents/" 2>/dev/null
 [ -d .claude/commands ] && cp -r .claude/commands/. "$SNAPSHOT_DIR/commands/" 2>/dev/null
 [ -d .claude/helpers ]  && cp -r .claude/helpers/. "$SNAPSHOT_DIR/helpers/" 2>/dev/null
@@ -320,8 +337,10 @@ Write `manifest.json` with every managed file listed:
   "timestamp": "<ISO-8601-UTC>",
   "initCommand": "npx ruflo@latest init --wizard",
   "files": {
-    ".claude/settings.json": { "hash": "<sha256>", "ownership": "shared" },
-    "CLAUDE.md":             { "hash": "<sha256>", "ownership": "section-managed" },
+    ".claude/settings.json": { "hash": "<sha256>", "ownership": "shared",
+      "_note": "hash of pure Ruflo staging output, not the merged file" },
+    "CLAUDE.md":             { "hash": "<sha256>", "ownership": "section-managed",
+      "_note": "hash of Ruflo sentinel block only, not the full merged file" },
     ".claude/agents/coder.md": { "hash": "<sha256>", "ownership": "whole-file" },
     ".claude/helpers/hook-handler.cjs": { "hash": "<sha256>", "ownership": "whole-file" }
   }
@@ -329,9 +348,9 @@ Write `manifest.json` with every managed file listed:
 ```
 
 Ownership rules:
-- `.claude/settings.json` → `"shared"`
-- `CLAUDE.md` → `"section-managed"`
-- Everything else → `"whole-file"`
+- `.claude/settings.json` → `"shared"` — snapshot from `$STAGING_DIR`
+- `CLAUDE.md` → `"section-managed"` — snapshot is sentinel block only, from `$STAGING_DIR`
+- Everything else → `"whole-file"` — snapshot from live applied file
 
 ---
 
@@ -377,7 +396,7 @@ Restore with:
   cp .claude/backup-YYYYMMDD-HHMMSS/CLAUDE.md CLAUDE.md
 
 Validation warnings:
-  ⚠ Hook event "SubagentEnd" unrecognised — kept but verify it works
+  ⚠ Hook event "SubagentEnd" unrecognised by this skill's validator — kept but verify it works
 
 Next: add Ruflo as an MCP server for runtime use:
   claude mcp add ruflo -- npx -y ruflo@latest mcp start

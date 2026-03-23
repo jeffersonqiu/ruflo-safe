@@ -53,13 +53,16 @@ BACKUP_DIR=".claude/backup-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR/agents" "$BACKUP_DIR/commands" "$BACKUP_DIR/helpers" \
          "$BACKUP_DIR/ruflo-snapshot"
 
-[ -f .claude/settings.json ]  && cp .claude/settings.json "$BACKUP_DIR/"
-[ -f CLAUDE.md ]              && cp CLAUDE.md "$BACKUP_DIR/"
-[ -d .claude/agents ]         && cp .claude/agents/*.md "$BACKUP_DIR/agents/" 2>/dev/null
-[ -d .claude/commands ]       && cp -r .claude/commands/. "$BACKUP_DIR/commands/" 2>/dev/null
-[ -d .claude/helpers ]        && cp -r .claude/helpers/. "$BACKUP_DIR/helpers/" 2>/dev/null
-[ -d .claude/ruflo-snapshot ] && cp -r .claude/ruflo-snapshot/. \
-                                   "$BACKUP_DIR/ruflo-snapshot/" 2>/dev/null
+[ -f .claude/settings.json ]       && cp .claude/settings.json "$BACKUP_DIR/"
+[ -f .claude/settings.local.json ] && cp .claude/settings.local.json "$BACKUP_DIR/"
+[ -f CLAUDE.md ]                   && cp CLAUDE.md "$BACKUP_DIR/"
+[ -d .claude/agents ]              && cp .claude/agents/*.md "$BACKUP_DIR/agents/" 2>/dev/null
+[ -d .claude/commands ]            && cp -r .claude/commands/. "$BACKUP_DIR/commands/" 2>/dev/null
+[ -d .claude/helpers ]             && cp -r .claude/helpers/. "$BACKUP_DIR/helpers/" 2>/dev/null
+[ -f .mcp.json ]                   && cp .mcp.json "$BACKUP_DIR/"
+[ -f claude-flow.config.json ]     && cp claude-flow.config.json "$BACKUP_DIR/"
+[ -d .claude/ruflo-snapshot ]      && cp -r .claude/ruflo-snapshot/. \
+                                       "$BACKUP_DIR/ruflo-snapshot/" 2>/dev/null
 
 echo "Backed up to $BACKUP_DIR"
 ls -la "$BACKUP_DIR"
@@ -127,6 +130,26 @@ diff -q ".claude/ruflo-snapshot/<file>" ".claude/<file>" \
 diff -q ".claude/ruflo-snapshot/<file>" "$STAGING_DIR/.claude/<file>" \
   > /dev/null 2>&1 && RUFLO_UPDATED=0 || RUFLO_UPDATED=1
 ```
+
+**Special case — `CLAUDE.md`**: Do not diff the whole file. The snapshot stores only the Ruflo sentinel block; OURS contains the full file including user content outside the markers. Diff only the sentinel block contents:
+
+```bash
+# Extract the sentinel block from OURS
+sed -n '/<!-- ruflo:start/,/<!-- ruflo:end -->/p' CLAUDE.md > /tmp/ours-ruflo-block.txt
+
+# BASE is already sentinel-block-only (stored that way in the snapshot)
+# THEIRS: extract sentinel block from staged output
+sed -n '/<!-- ruflo:start/,/<!-- ruflo:end -->/p' \
+  "$STAGING_DIR/CLAUDE.md" > /tmp/theirs-ruflo-block.txt
+
+diff -q ".claude/ruflo-snapshot/CLAUDE.md" /tmp/ours-ruflo-block.txt \
+  > /dev/null 2>&1 && USER_EDITED_BLOCK=0 || USER_EDITED_BLOCK=1
+
+diff -q ".claude/ruflo-snapshot/CLAUDE.md" /tmp/theirs-ruflo-block.txt \
+  > /dev/null 2>&1 && RUFLO_UPDATED_BLOCK=0 || RUFLO_UPDATED_BLOCK=1
+```
+
+User content outside the sentinel markers never contributes to conflict classification. A conflict is only raised when both the user edited inside the block AND Ruflo changed the block. If the user only edited outside the markers, `CLAUDE.md` is classified as "User edit only" (outside scope) and the Ruflo block is updated freely.
 
 Classification table:
 
@@ -251,7 +274,7 @@ cp "$STAGING_DIR/.claude/agents/security.md" .claude/agents/security.md
 
 **Step 6e — Soft validation** on final `settings.json`. Run all checks from Step 4 of the init skill:
 - JSON syntax valid
-- Hook event names recognised (`PreToolUse`, `PostToolUse`, `Stop`, `SubagentStop`, `Notification`)
+- Hook event names recognised by this skill's validator (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `SubagentStop`, `SubagentStart`, `Notification`, `UserPromptSubmit`, `SessionStart`, `SessionEnd`, `PreCompact`, `PermissionRequest`) — warn on any others as "unrecognised by this skill's validator" (not necessarily invalid)
 - All file paths in hook commands exist on disk
 - No duplicate hooks after normalisation
 - Permission patterns use `:*` suffix
@@ -269,14 +292,22 @@ NEW_VERSION=$(npx ruflo@latest --version 2>/dev/null | tr -d '\n')
 SNAPSHOT_DIR=".claude/ruflo-snapshot"
 mkdir -p "$SNAPSHOT_DIR/agents" "$SNAPSHOT_DIR/commands" "$SNAPSHOT_DIR/helpers"
 
-cp .claude/settings.json "$SNAPSHOT_DIR/settings.json"
-cp CLAUDE.md "$SNAPSHOT_DIR/CLAUDE.md"
+# shared: copy pure Ruflo output from staging, NOT the merged live file.
+# This preserves Ruflo's unmodified output as the merge base for the next upgrade.
+cp "$STAGING_DIR/.claude/settings.json" "$SNAPSHOT_DIR/settings.json"
+
+# section-managed: extract only the Ruflo sentinel block from staging.
+# The snapshot must not include user content outside the markers.
+sed -n '/<!-- ruflo:start/,/<!-- ruflo:end -->/p' \
+  "$STAGING_DIR/CLAUDE.md" > "$SNAPSHOT_DIR/CLAUDE.md"
+
+# whole-file: copy from the live applied file (correct — these are entirely Ruflo-owned).
 [ -d .claude/agents ]   && cp .claude/agents/*.md "$SNAPSHOT_DIR/agents/" 2>/dev/null
 [ -d .claude/commands ] && cp -r .claude/commands/. "$SNAPSHOT_DIR/commands/" 2>/dev/null
 [ -d .claude/helpers ]  && cp -r .claude/helpers/. "$SNAPSHOT_DIR/helpers/" 2>/dev/null
 ```
 
-Recompute SHA-256 hashes from the final written files:
+Recompute SHA-256 hashes. For `settings.json` and `CLAUDE.md`, hash the snapshot files (staging-sourced), not the live merged files:
 ```bash
 shasum -a 256 <file> | awk '{print $1}'
 ```
@@ -288,8 +319,10 @@ Overwrite `manifest.json` with the new version, timestamp, and all file entries:
   "timestamp": "<ISO-8601-UTC>",
   "initCommand": "npx ruflo@latest init upgrade",
   "files": {
-    ".claude/settings.json": { "hash": "<sha256>", "ownership": "shared" },
-    "CLAUDE.md":             { "hash": "<sha256>", "ownership": "section-managed" },
+    ".claude/settings.json": { "hash": "<sha256>", "ownership": "shared",
+      "_note": "hash of pure Ruflo staging output, not the merged file" },
+    "CLAUDE.md":             { "hash": "<sha256>", "ownership": "section-managed",
+      "_note": "hash of Ruflo sentinel block only, not the full merged file" },
     ".claude/agents/researcher.md": { "hash": "<sha256>", "ownership": "whole-file" },
     ".claude/agents/security.md":   { "hash": "<sha256>", "ownership": "whole-file" },
     ".claude/helpers/hook-handler.cjs": { "hash": "<sha256>", "ownership": "whole-file" }
